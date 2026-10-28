@@ -1,0 +1,294 @@
+name: Verify
+
+# Bridge workflow: this repo holds NO application code. On dispatch it
+# checks out the target (private) repository inside the ephemeral runner,
+# runs the full verification suite, and reports the result back as a
+# check-run on the private commit. On green + deploy=true it fires the
+# private repo's deploy workflow.
+#
+# Leak discipline — this file is public, and so are this run's logs:
+# every command whose output could name files, tests or code redirects
+# to $LOG_DIR and echoes only "OK"/"FAILED". Full logs ride back inside
+# the check-run summary on the private commit (collaborators only).
+# Never add a run: block that prints command output directly, and never
+# echo $PRIVATE_REPO or the PAT — secrets are masked but discipline is
+# the real guard. Do not add pull_request/push triggers: nothing
+# untrusted must ever execute here.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Commit SHA on the target repo to verify
+        required: true
+        type: string
+      ref:
+        description: Branch the SHA belongs to (concurrency grouping)
+        required: true
+        type: string
+      event:
+        description: Originating event (push|pull_request|schedule|workflow_dispatch)
+        required: true
+        type: string
+      deploy:
+        description: Fire the target repo's deploy workflow on success
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: ci-${{ inputs.ref }}
+  cancel-in-progress: ${{ inputs.event == 'pull_request' }}
+
+# This repo's own GITHUB_TOKEN gets nothing — the bridge PAT is used for
+# every call into the target repository.
+permissions: {}
+
+env:
+  PRIVATE_REPO: ${{ secrets.PRIVATE_REPO }}
+  TARGET_SHA: ${{ inputs.sha }}
+
+jobs:
+  verify:
+    name: Full suite + capacity races (MySQL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_DATABASE: bookings_test
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -proot"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    env:
+      APP_ENV: testing
+      BROADCAST_CONNECTION: 'null'
+      CACHE_STORE: array
+      DB_CONNECTION: mysql
+      DB_HOST: 127.0.0.1
+      DB_PORT: 3306
+      DB_DATABASE: bookings_test
+      DB_USERNAME: root
+      DB_PASSWORD: root
+      MAIL_MAILER: array
+      QUEUE_CONNECTION: sync
+      SESSION_DRIVER: array
+      GH_TOKEN: ${{ secrets.CI_BRIDGE_PAT }}
+      LOG_DIR: /tmp/ci-logs
+
+    steps:
+      - name: Open pending check-run
+        run: |
+          mkdir -p "$LOG_DIR"
+          check_id=$(gh api "repos/${PRIVATE_REPO}/check-runs" \
+            -f name="ci/verify" -f head_sha="${TARGET_SHA}" \
+            -f status=in_progress \
+            -f "details_url=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --jq .id 2>>"$LOG_DIR/00-checkrun-open.log") || { echo "check-run open: FAILED"; exit 1; }
+          echo "$check_id" > "$LOG_DIR/check-run-id"
+          echo "check-run open: OK"
+
+      - name: Checkout target
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ secrets.PRIVATE_REPO }}
+          token: ${{ secrets.CI_BRIDGE_PAT }}
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+          show-progress: false
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: mbstring, pdo_mysql, pcntl
+          coverage: none
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: |
+          {
+            composer install --no-interaction --prefer-dist
+            npm ci --no-audit --no-fund
+          } > "$LOG_DIR/01-install.log" 2>&1 || { echo "install: FAILED — see check-run"; exit 1; }
+          echo "install: OK"
+
+      - name: Prepare application
+        run: |
+          {
+            cp .env.example .env
+            php artisan key:generate
+          } > "$LOG_DIR/02-prepare.log" 2>&1 || { echo "prepare: FAILED — see check-run"; exit 1; }
+          echo "prepare: OK"
+
+      - name: Build frontend
+        run: |
+          npm run build > "$LOG_DIR/03-build.log" 2>&1 || { echo "build: FAILED — see check-run"; exit 1; }
+          echo "build: OK"
+
+      # Fail fast: a MySQL-incompatible migration (e.g. an auto-generated
+      # identifier over 64 chars) must die here in ~1 min with the real
+      # error — not be retried per test class inside the suite, where
+      # RefreshDatabase turns it into an hours-long migrate:fresh storm.
+      - name: Verify migrations on MySQL
+        run: |
+          php artisan migrate:fresh --no-interaction > "$LOG_DIR/04-migrate.log" 2>&1 || { echo "migrate: FAILED — see check-run"; exit 1; }
+          echo "migrate: OK"
+
+      # CapacityRaceTest is opt-in locally (needs pcntl + a disposable
+      # MySQL schema) — the MySQL service this job already runs IS the
+      # disposable schema.
+      - name: Prepare capacity-race schema
+        run: |
+          php -r 'new PDO("mysql:host=127.0.0.1;port=3306", "root", "root")->exec("CREATE DATABASE IF NOT EXISTS capacity_race");' > "$LOG_DIR/05-race-schema.log" 2>&1 || { echo "race schema: FAILED — see check-run"; exit 1; }
+          echo "race schema: OK"
+
+      - name: Run capacity race tests (MySQL)
+        env:
+          CAPACITY_RACE_DSN: mysql://root:root@127.0.0.1:3306/capacity_race
+        run: |
+          {
+            php artisan test --compact tests/Feature/Concurrency/CapacityRaceTest.php
+            php artisan test --compact tests/Feature/Concurrency/CapacityRaceMatrixTest.php
+          } > "$LOG_DIR/06-race-tests.log" 2>&1 || { echo "race tests: FAILED — see check-run"; exit 1; }
+          echo "race tests: OK"
+
+      # RunInSeparateProcess + RefreshDatabase re-runs migrate:fresh in the
+      # child on the shared MySQL database. The attribute/annotation only
+      # appears inside test classes, so a scoped grep is a cheap tripwire;
+      # the xml flag is matched only when enabled.
+      - name: Guard no process-isolated tests
+        run: |
+          {
+            ! grep -rn 'SeparateProcess' tests/ && ! grep -n 'processIsolation="true"' phpunit.xml
+          } > "$LOG_DIR/07-guard-isolation.log" 2>&1 || { echo "isolation guard: FAILED — see check-run"; exit 1; }
+          echo "isolation guard: OK"
+
+      # tests/Feature/Security/SEC*_*.php are adopted PoCs: they must stay
+      # byte-identical to their audit-side copies pinned in the manifest
+      # and never skip. Copied verbatim from the private workflow — the
+      # manifest lives in the checked-out tree.
+      - name: Guard security regression suite
+        run: |
+          {
+            manifest=docs/security-audit/poc-manifest.sha256
+            if [ ! -f "$manifest" ]; then echo "PoC manifest docs/security-audit/poc-manifest.sha256 is missing"; exit 1; fi
+            if ! sha256sum -c --strict --quiet "$manifest"; then echo "poc-tests content diverges from the pinned manifest"; exit 1; fi
+            # Two-way: every poc-tests file must be pinned.
+            while IFS= read -r f; do
+              if ! awk -v p="$f" '$2 == p { found=1 } END { exit !found }' "$manifest"; then echo "poc-tests file is not pinned in the manifest: $f"; exit 1; fi
+            done < <(find docs/security-audit -path "*/poc-tests/*" -name "*.php" | sort)
+            pending=""
+            while IFS= read -r src; do
+              base=$(basename "$src")
+              adopted="tests/Feature/Security/$base"
+              case " $pending " in *" $base "*)
+                if [ -e "$adopted" ]; then echo "$base is adopted; remove it from pending"; exit 1; fi
+                continue ;;
+              esac
+              if [ ! -f "$adopted" ]; then echo "pinned PoC is not adopted under tests/Feature/Security: $adopted"; exit 1; fi
+              if ! cmp -s "$adopted" "$src"; then echo "adopted PoC diverges from poc-tests: $adopted"; exit 1; fi
+            done < <(awk '{print $2}' "$manifest")
+            [ -d tests/Feature/Security ] || exit 0
+            if grep -rnE 'markTestSkipped|markTestIncomplete|#\[Requires' tests/Feature/Security/; then echo "tests/Feature/Security must not skip tests"; exit 1; fi
+            for f in tests/Feature/Security/SEC*_*.php; do
+              [ -e "$f" ] || continue
+              src=$(find docs/security-audit -path "*/poc-tests/Tests/Feature/Security/$(basename "$f")" -print -quit)
+              if [ ! -f "$src" ]; then echo "adopted PoC has no poc-tests source: $f"; exit 1; fi
+              if ! cmp -s "$f" "$src"; then echo "adopted PoC diverges from poc-tests: $f"; exit 1; fi
+            done
+          } > "$LOG_DIR/08-guard-security.log" 2>&1 || { echo "security guard: FAILED — see check-run"; exit 1; }
+          echo "security guard: OK"
+
+      - name: Run security regression suite
+        if: hashFiles('tests/Feature/Security/*.php') != ''
+        run: |
+          php artisan test --compact tests/Feature/Security > "$LOG_DIR/09-security-tests.log" 2>&1 || { echo "security tests: FAILED — see check-run"; exit 1; }
+          echo "security tests: OK"
+
+      - name: Run full test suite
+        run: |
+          php artisan test --compact > "$LOG_DIR/10-full-suite.log" 2>&1 || { echo "full suite: FAILED — see check-run"; exit 1; }
+          echo "full suite: OK"
+
+      - name: Static analysis
+        run: |
+          vendor/bin/phpstan analyse --no-progress --memory-limit=1G > "$LOG_DIR/11-phpstan.log" 2>&1 || { echo "phpstan: FAILED — see check-run"; exit 1; }
+          echo "phpstan: OK"
+
+      # Production packages only, high and critical severity. Escape hatch:
+      # composer.json config.audit.ignore (advisory id -> reason) or an npm
+      # overrides entry — never continue-on-error.
+      - name: Dependency audit
+        run: |
+          {
+            composer audit --locked --no-dev --abandoned=report --ignore-severity=low --ignore-severity=medium
+            npm audit --audit-level=high
+          } > "$LOG_DIR/12-audit.log" 2>&1 || { echo "dependency audit: FAILED — see check-run"; exit 1; }
+          echo "dependency audit: OK"
+
+      # Result reports to the PRIVATE repo's check-run (full log rides
+      # inside its summary, ~60KB cap). The public log stays clean.
+      - name: Publish result check-run
+        if: always()
+        run: |
+          check_id=$(cat "$LOG_DIR/check-run-id" 2>/dev/null || true)
+          [ -n "$check_id" ] || { echo "no check-run id — nothing to publish"; exit 0; }
+          if [ "${{ job.status }}" = "success" ]; then conclusion=success; else conclusion=failure; fi
+          {
+            echo "Result: $conclusion — run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo
+            for f in "$LOG_DIR"/[0-9]*.log; do
+              [ -e "$f" ] || continue
+              echo "===== $(basename "$f") ====="
+              cat "$f"
+              echo
+            done
+          } > "$LOG_DIR/full.log"
+          { head -c 45000 "$LOG_DIR/full.log"; echo; echo "...[truncated]..."; echo; tail -c 15000 "$LOG_DIR/full.log"; } > "$LOG_DIR/summary.txt"
+          jq -n \
+            --arg concl "$conclusion" \
+            --arg title "ci/verify — $conclusion" \
+            --rawfile summary "$LOG_DIR/summary.txt" \
+            '{status:"completed", conclusion:$concl, output:{title:$title, summary:$summary}}' \
+            | gh api "repos/${PRIVATE_REPO}/check-runs/${check_id}" -X PATCH --input - \
+            > "$LOG_DIR/13-checkrun-update.log" 2>&1 || { echo "check-run update: FAILED"; exit 1; }
+          echo "check-run: $conclusion"
+
+      - name: Trigger private deploy
+        if: success() && inputs.deploy == true
+        run: |
+          gh workflow run -R "${PRIVATE_REPO}" deploy.yml -r main -f sha="${TARGET_SHA}" \
+            > "$LOG_DIR/14-deploy-dispatch.log" 2>&1 || { echo "deploy dispatch: FAILED"; exit 1; }
+          echo "deploy: dispatched"
+
+      # Nightly-only notification: one open issue per calendar day on the
+      # private repo, comments on repeats instead of spamming.
+      - name: Open issue on nightly failure
+        if: failure() && inputs.event == 'schedule'
+        run: |
+          {
+            title="Nightly verify failed ($(date +%F))"
+            body="Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            existing=$(gh issue list -R "${PRIVATE_REPO}" --state open --search "\"$title\" in:title" --json number --jq '.[0].number' 2>/dev/null || true)
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" -R "${PRIVATE_REPO}" --body "$body"
+            else
+              gh issue create -R "${PRIVATE_REPO}" --title "$title" --body "$body" --label ci-failure \
+                || gh issue create -R "${PRIVATE_REPO}" --title "$title" --body "$body"
+            fi
+          } > "$LOG_DIR/15-issue.log" 2>&1 || { echo "issue: FAILED"; exit 1; }
+          echo "issue: handled"

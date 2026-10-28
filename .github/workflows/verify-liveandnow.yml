@@ -171,7 +171,11 @@ jobs:
           # Guard: a kill before "Open pending status" mkdir would leave
           # LOG_DIR missing and the failure would never reach the commit.
           mkdir -p "$LOG_DIR"
-          if [ "${{ job.status }}" = "success" ]; then state=success; else state=failure; fi
+          case "${{ job.status }}" in
+            success)   state=success ;;
+            cancelled) state=error ;;
+            *)         state=failure ;;
+          esac
           {
             echo "Result: $state — run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
             echo

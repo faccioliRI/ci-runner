@@ -3,13 +3,13 @@ name: Verify
 # Bridge workflow: this repo holds NO application code. On dispatch it
 # checks out the target (private) repository inside the ephemeral runner,
 # runs the full verification suite, and reports the result back as a
-# check-run on the private commit. On green + deploy=true it fires the
-# private repo's deploy workflow.
+# "ci/verify" commit status on the private commit. On green + deploy=true
+# it fires the private repo's deploy workflow.
 #
 # Leak discipline — this file is public, and so are this run's logs:
 # every command whose output could name files, tests or code redirects
 # to $LOG_DIR and echoes only "OK"/"FAILED". Full logs ride back inside
-# the check-run summary on the private commit (collaborators only).
+# a commit comment on the private commit (collaborators only).
 # Never add a run: block that prints command output directly, and never
 # echo $PRIVATE_REPO or the PAT — secrets are masked but discipline is
 # the real guard. Do not add pull_request/push triggers: nothing
@@ -127,7 +127,7 @@ jobs:
           {
             composer install --no-interaction --prefer-dist
             npm ci --no-audit --no-fund
-          } > "$LOG_DIR/01-install.log" 2>&1 || { echo "install: FAILED — see check-run"; exit 1; }
+          } > "$LOG_DIR/01-install.log" 2>&1 || { echo "install: FAILED — see commit comment"; exit 1; }
           echo "install: OK"
 
       - name: Prepare application
@@ -135,12 +135,12 @@ jobs:
           {
             cp .env.example .env
             php artisan key:generate
-          } > "$LOG_DIR/02-prepare.log" 2>&1 || { echo "prepare: FAILED — see check-run"; exit 1; }
+          } > "$LOG_DIR/02-prepare.log" 2>&1 || { echo "prepare: FAILED — see commit comment"; exit 1; }
           echo "prepare: OK"
 
       - name: Build frontend
         run: |
-          npm run build > "$LOG_DIR/03-build.log" 2>&1 || { echo "build: FAILED — see check-run"; exit 1; }
+          npm run build > "$LOG_DIR/03-build.log" 2>&1 || { echo "build: FAILED — see commit comment"; exit 1; }
           echo "build: OK"
 
       # Fail fast: a MySQL-incompatible migration (e.g. an auto-generated
@@ -149,7 +149,7 @@ jobs:
       # RefreshDatabase turns it into an hours-long migrate:fresh storm.
       - name: Verify migrations on MySQL
         run: |
-          php artisan migrate:fresh --no-interaction > "$LOG_DIR/04-migrate.log" 2>&1 || { echo "migrate: FAILED — see check-run"; exit 1; }
+          php artisan migrate:fresh --no-interaction > "$LOG_DIR/04-migrate.log" 2>&1 || { echo "migrate: FAILED — see commit comment"; exit 1; }
           echo "migrate: OK"
 
       # CapacityRaceTest is opt-in locally (needs pcntl + a disposable
@@ -157,7 +157,7 @@ jobs:
       # disposable schema.
       - name: Prepare capacity-race schema
         run: |
-          php -r 'new PDO("mysql:host=127.0.0.1;port=3306", "root", "root")->exec("CREATE DATABASE IF NOT EXISTS capacity_race");' > "$LOG_DIR/05-race-schema.log" 2>&1 || { echo "race schema: FAILED — see check-run"; exit 1; }
+          php -r 'new PDO("mysql:host=127.0.0.1;port=3306", "root", "root")->exec("CREATE DATABASE IF NOT EXISTS capacity_race");' > "$LOG_DIR/05-race-schema.log" 2>&1 || { echo "race schema: FAILED — see commit comment"; exit 1; }
           echo "race schema: OK"
 
       - name: Run capacity race tests (MySQL)
@@ -167,7 +167,7 @@ jobs:
           {
             php artisan test --compact tests/Feature/Concurrency/CapacityRaceTest.php
             php artisan test --compact tests/Feature/Concurrency/CapacityRaceMatrixTest.php
-          } > "$LOG_DIR/06-race-tests.log" 2>&1 || { echo "race tests: FAILED — see check-run"; exit 1; }
+          } > "$LOG_DIR/06-race-tests.log" 2>&1 || { echo "race tests: FAILED — see commit comment"; exit 1; }
           echo "race tests: OK"
 
       # RunInSeparateProcess + RefreshDatabase re-runs migrate:fresh in the
@@ -178,7 +178,7 @@ jobs:
         run: |
           {
             ! grep -rn 'SeparateProcess' tests/ && ! grep -n 'processIsolation="true"' phpunit.xml
-          } > "$LOG_DIR/07-guard-isolation.log" 2>&1 || { echo "isolation guard: FAILED — see check-run"; exit 1; }
+          } > "$LOG_DIR/07-guard-isolation.log" 2>&1 || { echo "isolation guard: FAILED — see commit comment"; exit 1; }
           echo "isolation guard: OK"
 
       # tests/Feature/Security/SEC*_*.php are adopted PoCs: they must stay
@@ -214,23 +214,23 @@ jobs:
               if [ ! -f "$src" ]; then echo "adopted PoC has no poc-tests source: $f"; exit 1; fi
               if ! cmp -s "$f" "$src"; then echo "adopted PoC diverges from poc-tests: $f"; exit 1; fi
             done
-          } > "$LOG_DIR/08-guard-security.log" 2>&1 || { echo "security guard: FAILED — see check-run"; exit 1; }
+          } > "$LOG_DIR/08-guard-security.log" 2>&1 || { echo "security guard: FAILED — see commit comment"; exit 1; }
           echo "security guard: OK"
 
       - name: Run security regression suite
         if: hashFiles('tests/Feature/Security/*.php') != ''
         run: |
-          php artisan test --compact tests/Feature/Security > "$LOG_DIR/09-security-tests.log" 2>&1 || { echo "security tests: FAILED — see check-run"; exit 1; }
+          php artisan test --compact tests/Feature/Security > "$LOG_DIR/09-security-tests.log" 2>&1 || { echo "security tests: FAILED — see commit comment"; exit 1; }
           echo "security tests: OK"
 
       - name: Run full test suite
         run: |
-          php artisan test --compact > "$LOG_DIR/10-full-suite.log" 2>&1 || { echo "full suite: FAILED — see check-run"; exit 1; }
+          php artisan test --compact > "$LOG_DIR/10-full-suite.log" 2>&1 || { echo "full suite: FAILED — see commit comment"; exit 1; }
           echo "full suite: OK"
 
       - name: Static analysis
         run: |
-          vendor/bin/phpstan analyse --no-progress --memory-limit=1G > "$LOG_DIR/11-phpstan.log" 2>&1 || { echo "phpstan: FAILED — see check-run"; exit 1; }
+          vendor/bin/phpstan analyse --no-progress --memory-limit=1G > "$LOG_DIR/11-phpstan.log" 2>&1 || { echo "phpstan: FAILED — see commit comment"; exit 1; }
           echo "phpstan: OK"
 
       # Production packages only, high and critical severity. Escape hatch:
@@ -241,7 +241,7 @@ jobs:
           {
             composer audit --locked --no-dev --abandoned=report --ignore-severity=low --ignore-severity=medium
             npm audit --audit-level=high
-          } > "$LOG_DIR/12-audit.log" 2>&1 || { echo "dependency audit: FAILED — see check-run"; exit 1; }
+          } > "$LOG_DIR/12-audit.log" 2>&1 || { echo "dependency audit: FAILED — see commit comment"; exit 1; }
           echo "dependency audit: OK"
 
       # Result reports to the PRIVATE repo as a commit status (green/red
@@ -250,7 +250,14 @@ jobs:
       - name: Publish result status
         if: always()
         run: |
-          if [ "${{ job.status }}" = "success" ]; then state=success; else state=failure; fi
+          # Guard: a kill before "Open pending status" mkdir would leave
+          # LOG_DIR missing and the failure would never reach the commit.
+          mkdir -p "$LOG_DIR"
+          case "${{ job.status }}" in
+            success)   state=success ;;
+            cancelled) state=error ;;
+            *)         state=failure ;;
+          esac
           {
             echo "Result: $state — run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
             echo
@@ -294,8 +301,8 @@ jobs:
             body="Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
             # REST only (fine-grained PAT): list open issues, match title,
             # comment on repeat or create.
-            existing=$(gh api "repos/${PRIVATE_REPO}/issues?state=open&per_page=100" \
-              --jq --arg t "$title" '.[] | select(.title == $t) | .number' 2>/dev/null | head -1 || true)
+            existing=$(gh api "repos/${PRIVATE_REPO}/issues?state=open&per_page=100" 2>/dev/null \
+              | jq -r --arg t "$title" '[.[] | select(.title == $t) | .number][0] // empty' || true)
             if [ -n "$existing" ]; then
               gh api -X POST "repos/${PRIVATE_REPO}/issues/${existing}/comments" -f body="$body"
             else

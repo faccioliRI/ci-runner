@@ -274,7 +274,11 @@ jobs:
       - name: Trigger private deploy
         if: success() && inputs.deploy == true
         run: |
-          gh workflow run -R "${PRIVATE_REPO}" deploy.yml -r main -f sha="${TARGET_SHA}" \
+          # gh workflow run / gh issue hit GraphQL — the bridge PAT is
+          # fine-grained (REST-only), so all cross-repo calls use gh api.
+          jq -n --arg sha "${TARGET_SHA}" \
+            '{ref:"main", inputs:{sha:$sha}}' \
+            | gh api -X POST "repos/${PRIVATE_REPO}/actions/workflows/deploy.yml/dispatches" --input - \
             > "$LOG_DIR/14-deploy-dispatch.log" 2>&1 || { echo "deploy dispatch: FAILED"; exit 1; }
           echo "deploy: dispatched"
 
@@ -286,12 +290,17 @@ jobs:
           {
             title="Nightly verify failed ($(date +%F))"
             body="Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-            existing=$(gh issue list -R "${PRIVATE_REPO}" --state open --search "\"$title\" in:title" --json number --jq '.[0].number' 2>/dev/null || true)
+            # REST only (fine-grained PAT): list open issues, match title,
+            # comment on repeat or create.
+            existing=$(gh api "repos/${PRIVATE_REPO}/issues?state=open&per_page=100" \
+              --jq --arg t "$title" '.[] | select(.title == $t) | .number' 2>/dev/null | head -1 || true)
             if [ -n "$existing" ]; then
-              gh issue comment "$existing" -R "${PRIVATE_REPO}" --body "$body"
+              gh api -X POST "repos/${PRIVATE_REPO}/issues/${existing}/comments" -f body="$body"
             else
-              gh issue create -R "${PRIVATE_REPO}" --title "$title" --body "$body" --label ci-failure \
-                || gh issue create -R "${PRIVATE_REPO}" --title "$title" --body "$body"
+              jq -n --arg t "$title" --arg b "$body" '{title:$t, body:$b, labels:["ci-failure"]}' \
+                | gh api -X POST "repos/${PRIVATE_REPO}/issues" --input - \
+                || jq -n --arg t "$title" --arg b "$body" '{title:$t, body:$b}' \
+                | gh api -X POST "repos/${PRIVATE_REPO}/issues" --input -
             fi
           } > "$LOG_DIR/15-issue.log" 2>&1 || { echo "issue: FAILED"; exit 1; }
           echo "issue: handled"

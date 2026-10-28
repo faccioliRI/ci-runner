@@ -85,16 +85,17 @@ jobs:
       LOG_DIR: /tmp/ci-logs
 
     steps:
-      - name: Open pending check-run
+      - name: Open pending status
         run: |
           mkdir -p "$LOG_DIR"
-          check_id=$(gh api "repos/${PRIVATE_REPO}/check-runs" \
-            -f name="ci/verify" -f head_sha="${TARGET_SHA}" \
-            -f status=in_progress \
-            -f "details_url=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
-            --jq .id 2>>"$LOG_DIR/00-checkrun-open.log") || { echo "check-run open: FAILED"; exit 1; }
-          echo "$check_id" > "$LOG_DIR/check-run-id"
-          echo "check-run open: OK"
+          # Commit statuses, not check-runs: this token is a fine-grained
+          # PAT whose surface has no Checks permission. A status on the
+          # head sha still surfaces on the PR and gates the deploy job.
+          jq -n --arg url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            '{state:"pending", context:"ci/verify", target_url:$url, description:"verifying on public runner"}' \
+            | gh api -X POST "repos/${PRIVATE_REPO}/statuses/${TARGET_SHA}" --input - \
+            > "$LOG_DIR/00-status-open.log" 2>&1 || { echo "status open: FAILED"; exit 1; }
+          echo "status open: OK"
 
       - name: Checkout target
         uses: actions/checkout@v7
@@ -243,16 +244,15 @@ jobs:
           } > "$LOG_DIR/12-audit.log" 2>&1 || { echo "dependency audit: FAILED — see check-run"; exit 1; }
           echo "dependency audit: OK"
 
-      # Result reports to the PRIVATE repo's check-run (full log rides
-      # inside its summary, ~60KB cap). The public log stays clean.
-      - name: Publish result check-run
+      # Result reports to the PRIVATE repo as a commit status (green/red
+      # marker) + a commit comment carrying the full log (~60KB) — both
+      # visible to private collaborators only. The public log stays clean.
+      - name: Publish result status
         if: always()
         run: |
-          check_id=$(cat "$LOG_DIR/check-run-id" 2>/dev/null || true)
-          [ -n "$check_id" ] || { echo "no check-run id — nothing to publish"; exit 0; }
-          if [ "${{ job.status }}" = "success" ]; then conclusion=success; else conclusion=failure; fi
+          if [ "${{ job.status }}" = "success" ]; then state=success; else state=failure; fi
           {
-            echo "Result: $conclusion — run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "Result: $state — run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
             echo
             for f in "$LOG_DIR"/[0-9]*.log; do
               [ -e "$f" ] || continue
@@ -262,14 +262,16 @@ jobs:
             done
           } > "$LOG_DIR/full.log"
           { head -c 45000 "$LOG_DIR/full.log"; echo; echo "...[truncated]..."; echo; tail -c 15000 "$LOG_DIR/full.log"; } > "$LOG_DIR/summary.txt"
-          jq -n \
-            --arg concl "$conclusion" \
-            --arg title "ci/verify — $conclusion" \
-            --rawfile summary "$LOG_DIR/summary.txt" \
-            '{status:"completed", conclusion:$concl, output:{title:$title, summary:$summary}}' \
-            | gh api "repos/${PRIVATE_REPO}/check-runs/${check_id}" -X PATCH --input - \
-            > "$LOG_DIR/13-checkrun-update.log" 2>&1 || { echo "check-run update: FAILED"; exit 1; }
-          echo "check-run: $conclusion"
+          jq -n --arg st "$state" \
+            --arg url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --arg desc "ci/verify — $state" \
+            '{state:$st, context:"ci/verify", target_url:$url, description:$desc}' \
+            | gh api -X POST "repos/${PRIVATE_REPO}/statuses/${TARGET_SHA}" --input - \
+            > "$LOG_DIR/13-status-update.log" 2>&1 || { echo "status update: FAILED"; exit 1; }
+          jq -n --rawfile body "$LOG_DIR/summary.txt" '{body:$body}' \
+            | gh api -X POST "repos/${PRIVATE_REPO}/commits/${TARGET_SHA}/comments" --input - \
+            >> "$LOG_DIR/13-status-update.log" 2>&1 || { echo "commit comment: FAILED"; exit 1; }
+          echo "status: $state"
 
       - name: Trigger private deploy
         if: success() && inputs.deploy == true

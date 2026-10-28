@@ -157,7 +157,7 @@ jobs:
       - name: Dependency audit
         run: |
           {
-            composer audit --locked --no-dev --abandoned=report --ignore-severity=low --ignore-severity=medium
+            composer audit --locked --no-dev --abandoned=report --ignore-severity=low --ignore-severity=medium &&
             npm audit --audit-level=high
           } > "$LOG_DIR/05-audit.log" 2>&1 || { echo "dependency audit: FAILED — see commit status"; exit 1; }
           echo "dependency audit: OK"
@@ -168,6 +168,9 @@ jobs:
       - name: Publish result status
         if: always()
         run: |
+          # Guard: a kill before "Open pending status" mkdir would leave
+          # LOG_DIR missing and the failure would never reach the commit.
+          mkdir -p "$LOG_DIR"
           if [ "${{ job.status }}" = "success" ]; then state=success; else state=failure; fi
           {
             echo "Result: $state — run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"

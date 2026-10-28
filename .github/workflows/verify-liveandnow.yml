@@ -193,9 +193,11 @@ jobs:
             '{state:$st, context:"ci/verify", target_url:$url, description:$desc}' \
             | gh api -X POST "repos/${PRIVATE_REPO}/statuses/${TARGET_SHA}" --input - \
             > "$LOG_DIR/13-status-update.log" 2>&1 || { echo "status update: FAILED"; exit 1; }
+          # Comment failure must NOT fail the job — the ci/verify status
+          # above is the gate input; the log comment is best-effort detail.
           jq -n --rawfile body "$LOG_DIR/summary.txt" '{body:$body}' \
             | gh api -X POST "repos/${PRIVATE_REPO}/commits/${TARGET_SHA}/comments" --input - \
-            >> "$LOG_DIR/13-status-update.log" 2>&1 || { echo "commit comment: FAILED"; exit 1; }
+            >> "$LOG_DIR/13-status-update.log" 2>&1 || echo "commit comment: FAILED (status already posted)" >&2
           echo "status: $state"
 
       - name: Trigger private deploy
@@ -217,13 +219,13 @@ jobs:
           {
             title="Nightly verify failed ($(date +%F))"
             body="Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-            # REST only (fine-grained PAT): list open issues, match title,
-            # comment on repeat or create.
-            # jq runs as a pipe, not via --jq: gh api has no --arg pass-through.
-            # .pull_request == null filters PRs out of the issues listing.
-            existing=$(gh api "repos/${PRIVATE_REPO}/issues?state=open&per_page=100" 2>/dev/null \
-              | jq -r --arg t "$title" '.[] | select(.pull_request == null and .title == $t) | .number' \
-              | head -1 || true)
+            # REST only (fine-grained PAT): title search beats scanning
+            # issues?state=open — that caps at 100 and silently duplicates
+            # the daily issue on busy repos. No label filter: issues made by
+            # the no-label fallback below would be missed and duplicated.
+            existing=$(gh api "search/issues" \
+              -f q="repo:${PRIVATE_REPO} is:open \"${title}\" in:title" \
+              --jq '.items[0].number // empty' 2>/dev/null || true)
             if [ -n "$existing" ]; then
               gh api -X POST "repos/${PRIVATE_REPO}/issues/${existing}/comments" -f body="$body"
             else

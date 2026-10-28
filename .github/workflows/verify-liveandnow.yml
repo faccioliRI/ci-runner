@@ -1,0 +1,222 @@
+name: Verify liveandnow
+
+# Bridge workflow: this repo holds NO application code. On dispatch it
+# checks out the target (private) liveandnow repository inside the
+# ephemeral runner, runs the full verification suite, and reports the
+# result back as a "ci/verify" commit status on the private commit.
+# On green + deploy=true it fires the private repo's deploy.yml.
+#
+# Sibling of verify.yml (BookingsCalendar) — separate file because the
+# suite, the env and the target-repo secret differ. Do not merge the two
+# by parameterising repo name: a typo'd input would point a run at the
+# wrong codebase.
+#
+# Leak discipline — this file is public, and so are this run's logs:
+# every command whose output could name files, tests or code redirects
+# to $LOG_DIR and echoes only "OK"/"FAILED". Full logs ride back inside
+# the commit status + commit comment on the private commit
+# (collaborators only). Never add a run: block that prints command
+# output directly, and never echo $PRIVATE_REPO or the PAT — secrets are
+# masked but discipline is the real guard. Do not add pull_request/push
+# triggers: nothing untrusted must ever execute here.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Commit SHA on the target repo to verify
+        required: true
+        type: string
+      ref:
+        description: Branch the SHA belongs to (concurrency grouping)
+        required: true
+        type: string
+      event:
+        description: Originating event (push|pull_request|schedule|workflow_dispatch)
+        required: true
+        type: string
+      deploy:
+        description: Fire the target repo's deploy workflow on success
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  # Namespaced: concurrency keys are repo-wide — a bare "ci-<ref>" here
+  # would share one queue slot with BookingsCalendar's verify.yml.
+  group: ci-liveandnow-${{ inputs.ref }}
+  cancel-in-progress: ${{ inputs.event == 'pull_request' }}
+
+# This repo's own GITHUB_TOKEN gets nothing — the bridge PAT is used for
+# every call into the target repository.
+permissions: {}
+
+env:
+  PRIVATE_REPO: ${{ secrets.PRIVATE_REPO_LIVEANDNOW }}
+  TARGET_SHA: ${{ inputs.sha }}
+
+jobs:
+  verify:
+    name: Full test suite (sqlite)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      APP_ENV: testing
+      GH_TOKEN: ${{ secrets.CI_BRIDGE_PAT }}
+      LOG_DIR: /tmp/ci-logs
+      # phpunit.xml already pins sqlite :memory: + array/sync drivers;
+      # declared here so the contract survives a phpunit.xml regression.
+      DB_CONNECTION: sqlite
+      DB_DATABASE: ':memory:'
+      BROADCAST_CONNECTION: 'null'
+      CACHE_STORE: array
+      MAIL_MAILER: array
+      QUEUE_CONNECTION: sync
+      SESSION_DRIVER: array
+
+    steps:
+      - name: Open pending status
+        run: |
+          mkdir -p "$LOG_DIR"
+          # Commit statuses, not check-runs: this token is a fine-grained
+          # PAT whose surface has no Checks permission. A status on the
+          # head sha still surfaces on the PR and gates the deploy job.
+          jq -n --arg url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            '{state:"pending", context:"ci/verify", target_url:$url, description:"verifying on public runner"}' \
+            | gh api -X POST "repos/${PRIVATE_REPO}/statuses/${TARGET_SHA}" --input - \
+            > "$LOG_DIR/00-status-open.log" 2>&1 || { echo "status open: FAILED"; exit 1; }
+          echo "status open: OK"
+
+      - name: Checkout target
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ secrets.PRIVATE_REPO_LIVEANDNOW }}
+          token: ${{ secrets.CI_BRIDGE_PAT }}
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+          show-progress: false
+          # Full history: cheap for this repo and keeps git-based tests
+          # (legal-doc dating, changelog tooling) honest if any appear.
+          fetch-depth: 0
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: mbstring, xml, ctype, json, bcmath, pdo, pdo_sqlite, pdo_mysql, zip
+          coverage: none
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: |
+          {
+            composer install --no-interaction --prefer-dist
+            npm ci --no-audit --no-fund
+          } > "$LOG_DIR/01-install.log" 2>&1 || { echo "install: FAILED — see commit status"; exit 1; }
+          echo "install: OK"
+
+      - name: Prepare application
+        run: |
+          {
+            cp .env.example .env
+            php artisan key:generate
+          } > "$LOG_DIR/02-prepare.log" 2>&1 || { echo "prepare: FAILED — see commit status"; exit 1; }
+          echo "prepare: OK"
+
+      # Tests need the Vite manifest — build before the suite (same order
+      # the old VPS ci-deploy.sh used).
+      - name: Build frontend
+        run: |
+          npm run build > "$LOG_DIR/03-build.log" 2>&1 || { echo "build: FAILED — see commit status"; exit 1; }
+          echo "build: OK"
+
+      # config:clear first — a stale bootstrap/cache/config.php would leak
+      # into the test bootstrap. The suite runs against sqlite :memory:
+      # per phpunit.xml; no MySQL service needed here.
+      - name: Run full test suite
+        run: |
+          {
+            php artisan config:clear
+            php artisan test
+          } > "$LOG_DIR/04-tests.log" 2>&1 || { echo "tests: FAILED — see commit status"; exit 1; }
+          echo "tests: OK"
+
+      # Production packages only, high and critical severity. Escape hatch:
+      # composer.json config.audit.ignore (advisory id -> reason) or an npm
+      # overrides entry — never continue-on-error.
+      - name: Dependency audit
+        run: |
+          {
+            composer audit --locked --no-dev --abandoned=report --ignore-severity=low --ignore-severity=medium
+            npm audit --audit-level=high
+          } > "$LOG_DIR/05-audit.log" 2>&1 || { echo "dependency audit: FAILED — see commit status"; exit 1; }
+          echo "dependency audit: OK"
+
+      # Result reports to the PRIVATE repo as a commit status (green/red
+      # marker) + a commit comment carrying the full log (~60KB) — both
+      # visible to private collaborators only. The public log stays clean.
+      - name: Publish result status
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then state=success; else state=failure; fi
+          {
+            echo "Result: $state — run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo
+            for f in "$LOG_DIR"/[0-9]*.log; do
+              [ -e "$f" ] || continue
+              echo "===== $(basename "$f") ====="
+              cat "$f"
+              echo
+            done
+          } > "$LOG_DIR/full.log"
+          { head -c 45000 "$LOG_DIR/full.log"; echo; echo "...[truncated]..."; echo; tail -c 15000 "$LOG_DIR/full.log"; } > "$LOG_DIR/summary.txt"
+          jq -n --arg st "$state" \
+            --arg url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --arg desc "ci/verify — $state" \
+            '{state:$st, context:"ci/verify", target_url:$url, description:$desc}' \
+            | gh api -X POST "repos/${PRIVATE_REPO}/statuses/${TARGET_SHA}" --input - \
+            > "$LOG_DIR/13-status-update.log" 2>&1 || { echo "status update: FAILED"; exit 1; }
+          jq -n --rawfile body "$LOG_DIR/summary.txt" '{body:$body}' \
+            | gh api -X POST "repos/${PRIVATE_REPO}/commits/${TARGET_SHA}/comments" --input - \
+            >> "$LOG_DIR/13-status-update.log" 2>&1 || { echo "commit comment: FAILED"; exit 1; }
+          echo "status: $state"
+
+      - name: Trigger private deploy
+        if: success() && inputs.deploy == true
+        run: |
+          # gh workflow run / gh issue hit GraphQL — the bridge PAT is
+          # fine-grained (REST-only), so all cross-repo calls use gh api.
+          jq -n --arg sha "${TARGET_SHA}" \
+            '{ref:"main", inputs:{sha:$sha}}' \
+            | gh api -X POST "repos/${PRIVATE_REPO}/actions/workflows/deploy.yml/dispatches" --input - \
+            > "$LOG_DIR/14-deploy-dispatch.log" 2>&1 || { echo "deploy dispatch: FAILED"; exit 1; }
+          echo "deploy: dispatched"
+
+      # Nightly-only notification: one open issue per calendar day on the
+      # private repo, comments on repeats instead of spamming.
+      - name: Open issue on nightly failure
+        if: failure() && inputs.event == 'schedule'
+        run: |
+          {
+            title="Nightly verify failed ($(date +%F))"
+            body="Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            # REST only (fine-grained PAT): list open issues, match title,
+            # comment on repeat or create.
+            existing=$(gh api "repos/${PRIVATE_REPO}/issues?state=open&per_page=100" \
+              --jq --arg t "$title" '.[] | select(.title == $t) | .number' 2>/dev/null | head -1 || true)
+            if [ -n "$existing" ]; then
+              gh api -X POST "repos/${PRIVATE_REPO}/issues/${existing}/comments" -f body="$body"
+            else
+              jq -n --arg t "$title" --arg b "$body" '{title:$t, body:$b, labels:["ci-failure"]}' \
+                | gh api -X POST "repos/${PRIVATE_REPO}/issues" --input - \
+                || jq -n --arg t "$title" --arg b "$body" '{title:$t, body:$b}' \
+                | gh api -X POST "repos/${PRIVATE_REPO}/issues" --input -
+            fi
+          } > "$LOG_DIR/15-issue.log" 2>&1 || { echo "issue: FAILED"; exit 1; }
+          echo "issue: handled"

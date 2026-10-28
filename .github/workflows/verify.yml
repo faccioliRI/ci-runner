@@ -104,6 +104,9 @@ jobs:
           ref: ${{ inputs.sha }}
           persist-credentials: false
           show-progress: false
+          # Legal002Test dates legal docs via `git log` — a shallow clone
+          # only sees HEAD and falls back to (lying) checkout mtimes.
+          fetch-depth: 0
 
       - name: Set up PHP
         uses: shivammathur/setup-php@v2

@@ -137,6 +137,7 @@ jobs:
       # Tests need the Vite manifest — build before the suite (same order
       # the old VPS ci-deploy.sh used).
       - name: Build frontend
+        id: build
         run: |
           npm run build > "$LOG_DIR/03-build.log" 2>&1 || { echo "build: FAILED — see commit status"; exit 1; }
           echo "build: OK"
@@ -145,6 +146,7 @@ jobs:
       # into the test bootstrap. The suite runs against sqlite :memory:
       # per phpunit.xml; no MySQL service needed here.
       - name: Run full test suite
+        id: tests
         run: |
           {
             php artisan config:clear && php artisan test
@@ -214,7 +216,9 @@ jobs:
       # Nightly-only notification: one open issue per calendar day on the
       # private repo, comments on repeats instead of spamming.
       - name: Open issue on nightly failure
-        if: failure() && inputs.event == 'schedule'
+        # failure() alone also fires when the status/comment API calls failed —
+        # only open the nightly issue when the suite itself (or its build) failed.
+        if: failure() && inputs.event == 'schedule' && (steps.tests.outcome == 'failure' || steps.build.outcome == 'failure')
         run: |
           {
             title="Nightly verify failed ($(date +%F))"

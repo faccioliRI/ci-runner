@@ -195,7 +195,7 @@ jobs:
             while IFS= read -r f; do
               if ! awk -v p="$f" '$2 == p { found=1 } END { exit !found }' "$manifest"; then echo "poc-tests file is not pinned in the manifest: $f"; exit 1; fi
             done < <(find docs/security-audit -path "*/poc-tests/*" -name "*.php" | sort)
-            pending="SEC085_CustomerSeatStaffGrantsTest.php"
+            pending=""
             while IFS= read -r src; do
               base=$(basename "$src")
               adopted="tests/Feature/Security/$base"

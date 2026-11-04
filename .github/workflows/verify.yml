@@ -1,15 +1,15 @@
 name: Verify
 
 # Bridge workflow: this repo holds NO application code. On dispatch it
-# checks out the target (private) repository inside the ephemeral runner,
-# runs the full verification suite, and reports the result back as a
+# checks out the target (private) repository on isolated runners,
+# runs cheap checks before parallel suite/race jobs, and reports one
 # "ci/verify" commit status on the private commit. On green + deploy=true
 # it fires the private repo's deploy workflow.
 #
 # Leak discipline — this file is public, and so are this run's logs:
 # every command whose output could name files, tests or code redirects
-# to $LOG_DIR and echoes only "OK"/"FAILED". Full logs ride back inside
-# a commit comment on the private commit (collaborators only).
+# to $LOG_DIR and echoes only "OK"/"FAILED". Each job posts its logs
+# inside a private commit comment. Never upload public artifacts.
 # Never add a run: block that prints command output directly, and never
 # echo $PRIVATE_REPO or the PAT — secrets are masked but discipline is
 # the real guard. Do not add pull_request/push triggers: nothing
@@ -38,23 +38,27 @@ on:
 
 concurrency:
   group: ci-${{ inputs.ref }}
-  cancel-in-progress: ${{ inputs.event == 'pull_request' }}
+  cancel-in-progress: ${{ inputs.ref != 'main' }}
 
 # This repo's own GITHUB_TOKEN gets nothing — the bridge PAT is used for
 # every call into the target repository.
 permissions: {}
+
+defaults:
+  run:
+    shell: bash
 
 env:
   PRIVATE_REPO: ${{ secrets.PRIVATE_REPO }}
   TARGET_SHA: ${{ inputs.sha }}
 
 jobs:
-  verify:
-    name: Full suite + capacity races (MySQL)
+  check:
+    name: Fail-fast checks (MySQL)
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 15
 
-    services:
+    services: &mysql-service
       mysql:
         image: mysql:8.4
         env:
@@ -68,7 +72,7 @@ jobs:
           --health-timeout=5s
           --health-retries=10
 
-    env:
+    env: &job-env
       APP_ENV: testing
       BROADCAST_CONNECTION: 'null'
       CACHE_STORE: array
@@ -82,6 +86,7 @@ jobs:
       QUEUE_CONNECTION: sync
       SESSION_DRIVER: array
       LOG_DIR: /tmp/ci-logs
+      COMPOSER_CACHE_DIR: /tmp/composer-cache
 
     steps:
       - name: Open pending status
@@ -89,6 +94,10 @@ jobs:
           GH_TOKEN: ${{ secrets.BOOKINGS_CI_BRIDGE_PAT }}
         run: |
           mkdir -p "$LOG_DIR"
+          if [[ ! "$TARGET_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "inputs: FAILED"
+            exit 1
+          fi
           # Commit statuses, not check-runs: this token is a fine-grained
           # PAT whose surface has no Checks permission. A status on the
           # head sha still surfaces on the PR and gates the deploy job.
@@ -98,8 +107,9 @@ jobs:
             > "$LOG_DIR/00-status-open.log" 2>&1 || { echo "status open: FAILED"; exit 1; }
           echo "status open: OK"
 
-      - name: Checkout target
-        uses: actions/checkout@v7
+      - &checkout
+        name: Checkout target
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: ${{ secrets.PRIVATE_REPO }}
           token: ${{ secrets.BOOKINGS_CI_READ_PAT }}
@@ -110,7 +120,8 @@ jobs:
           fetch-depth: 1
           fetch-tags: false
 
-      - name: Fetch target history privately
+      - &history
+        name: Fetch target history privately
         env:
           CHECKOUT_TOKEN: ${{ secrets.BOOKINGS_CI_READ_PAT }}
         run: |
@@ -130,20 +141,30 @@ jobs:
             > "$LOG_DIR/00-history.log" 2>&1 || { echo "history: FAILED"; exit 1; }
           echo "history: OK"
 
-      - name: Set up PHP
-        uses: shivammathur/setup-php@v2
+      - &php
+        name: Set up PHP
+        uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # v2
         with:
           php-version: '8.4'
           extensions: mbstring, pdo_mysql, pcntl
           coverage: none
 
-      - name: Set up Node
-        uses: actions/setup-node@v7
+      - &node
+        name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 22
           cache: npm
 
-      - name: Install dependencies
+      - &composer-cache
+        name: Cache Composer downloads
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: /tmp/composer-cache/files
+          key: ${{ runner.os }}-composer-${{ hashFiles('composer.lock') }}
+
+      - &install
+        name: Install dependencies
         run: |
           {
             composer install --no-interaction --prefer-dist &&
@@ -151,7 +172,8 @@ jobs:
           } > "$LOG_DIR/01-install.log" 2>&1 || { echo "install: FAILED — see commit comment"; exit 1; }
           echo "install: OK"
 
-      - name: Prepare application
+      - &prepare
+        name: Prepare application
         run: |
           {
             cp .env.example .env &&
@@ -159,37 +181,11 @@ jobs:
           } > "$LOG_DIR/02-prepare.log" 2>&1 || { echo "prepare: FAILED — see commit comment"; exit 1; }
           echo "prepare: OK"
 
-      - name: Build frontend
+      - &build
+        name: Build frontend
         run: |
           npm run build > "$LOG_DIR/03-build.log" 2>&1 || { echo "build: FAILED — see commit comment"; exit 1; }
           echo "build: OK"
-
-      # Fail fast: a MySQL-incompatible migration (e.g. an auto-generated
-      # identifier over 64 chars) must die here in ~1 min with the real
-      # error — not be retried per test class inside the suite, where
-      # RefreshDatabase turns it into an hours-long migrate:fresh storm.
-      - name: Verify migrations on MySQL
-        run: |
-          php artisan migrate:fresh --no-interaction > "$LOG_DIR/04-migrate.log" 2>&1 || { echo "migrate: FAILED — see commit comment"; exit 1; }
-          echo "migrate: OK"
-
-      # CapacityRaceTest is opt-in locally (needs pcntl + a disposable
-      # MySQL schema) — the MySQL service this job already runs IS the
-      # disposable schema.
-      - name: Prepare capacity-race schema
-        run: |
-          php -r 'new PDO("mysql:host=127.0.0.1;port=3306", "root", "root")->exec("CREATE DATABASE IF NOT EXISTS capacity_race");' > "$LOG_DIR/05-race-schema.log" 2>&1 || { echo "race schema: FAILED — see commit comment"; exit 1; }
-          echo "race schema: OK"
-
-      - name: Run capacity race tests (MySQL)
-        env:
-          CAPACITY_RACE_DSN: mysql://root:root@127.0.0.1:3306/capacity_race
-        run: |
-          {
-            php artisan test --compact tests/Feature/Concurrency/CapacityRaceTest.php &&
-            php artisan test --compact tests/Feature/Concurrency/CapacityRaceMatrixTest.php
-          } > "$LOG_DIR/06-race-tests.log" 2>&1 || { echo "race tests: FAILED — see commit comment"; exit 1; }
-          echo "race tests: OK"
 
       # RunInSeparateProcess + RefreshDatabase re-runs migrate:fresh in the
       # child on the shared MySQL database. The attribute/annotation only
@@ -217,6 +213,10 @@ jobs:
               if ! awk -v p="$f" '$2 == p { found=1 } END { exit !found }' "$manifest"; then echo "poc-tests file is not pinned in the manifest: $f"; exit 1; fi
             done < <(find docs/security-audit -path "*/poc-tests/*" -name "*.php" | sort)
             pending=""
+            pending_file=docs/security-audit/poc-pending.txt
+            if [ -f "$pending_file" ]; then
+              pending=$(sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d' "$pending_file" | tr '\n' ' ')
+            fi
             while IFS= read -r src; do
               base=$(basename "$src")
               adopted="tests/Feature/Security/$base"
@@ -238,22 +238,6 @@ jobs:
           } > "$LOG_DIR/08-guard-security.log" 2>&1 || { echo "security guard: FAILED — see commit comment"; exit 1; }
           echo "security guard: OK"
 
-      - name: Run security regression suite
-        if: hashFiles('tests/Feature/Security/*.php') != ''
-        run: |
-          php artisan test --compact tests/Feature/Security > "$LOG_DIR/09-security-tests.log" 2>&1 || { echo "security tests: FAILED — see commit comment"; exit 1; }
-          echo "security tests: OK"
-
-      - name: Run full test suite
-        run: |
-          php artisan test --compact > "$LOG_DIR/10-full-suite.log" 2>&1 || { echo "full suite: FAILED — see commit comment"; exit 1; }
-          echo "full suite: OK"
-
-      - name: Static analysis
-        run: |
-          vendor/bin/phpstan analyse --no-progress --memory-limit=1G > "$LOG_DIR/11-phpstan.log" 2>&1 || { echo "phpstan: FAILED — see commit comment"; exit 1; }
-          echo "phpstan: OK"
-
       # Production packages only, high and critical severity. Escape hatch:
       # composer.json config.audit.ignore (advisory id -> reason) or an npm
       # overrides entry — never continue-on-error.
@@ -265,24 +249,44 @@ jobs:
           } > "$LOG_DIR/12-audit.log" 2>&1 || { echo "dependency audit: FAILED — see commit comment"; exit 1; }
           echo "dependency audit: OK"
 
-      # Result reports to the PRIVATE repo as a commit status (green/red
-      # marker) + a commit comment carrying the full log (~60KB) — both
-      # visible to private collaborators only. The public log stays clean.
-      - name: Publish result status
+      - name: Check PHP formatting
+        run: |
+          vendor/bin/pint --test > "$LOG_DIR/10-pint.log" 2>&1 || { echo "formatting: FAILED — see commit comment"; exit 1; }
+          echo "formatting: OK"
+
+      - name: Static analysis
+        run: |
+          vendor/bin/phpstan analyse --no-progress --memory-limit=1G > "$LOG_DIR/11-phpstan.log" 2>&1 || { echo "phpstan: FAILED — see commit comment"; exit 1; }
+          echo "phpstan: OK"
+
+      - &migrate
+        name: Verify migrations on MySQL
+        run: |
+          php artisan migrate:fresh --no-interaction > "$LOG_DIR/04-migrate.log" 2>&1 || { echo "migrate: FAILED — see commit comment"; exit 1; }
+          echo "migrate: OK"
+
+      - name: Run fail-fast application tests
+        run: |
+          php artisan test --compact tests/Feature/TranslationIntegrityTest.php tests/Feature/TranslationKeysTest.php tests/Feature/LangParityTest.php tests/Feature/Changelog \
+            > "$LOG_DIR/09-fast-tests.log" 2>&1 || { echo "fast tests: FAILED — see commit comment"; exit 1; }
+          echo "fast tests: OK"
+
+      - &private-logs
+        name: Publish private job log
         env:
           GH_TOKEN: ${{ secrets.BOOKINGS_CI_BRIDGE_PAT }}
+          JOB_RESULT: ${{ job.status }}
         if: always()
         run: |
-          # Guard: a kill before "Open pending status" mkdir would leave
-          # LOG_DIR missing and the failure would never reach the commit.
           mkdir -p "$LOG_DIR"
-          case "${{ job.status }}" in
+          case "$JOB_RESULT" in
             success)   state=success ;;
             cancelled) state=error ;;
             *)         state=failure ;;
           esac
           {
-            echo "Result: $state — run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "Job: $GITHUB_JOB - result: $state"
+            echo "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
             echo
             for f in "$LOG_DIR"/[0-9]*.log; do
               [ -e "$f" ] || continue
@@ -292,21 +296,119 @@ jobs:
             done
           } > "$LOG_DIR/full.log"
           { head -c 45000 "$LOG_DIR/full.log"; echo; echo "...[truncated]..."; echo; tail -c 15000 "$LOG_DIR/full.log"; } > "$LOG_DIR/summary.txt"
+          if jq -n --rawfile body "$LOG_DIR/summary.txt" '{body:$body}' \
+            | gh api -X POST "repos/${PRIVATE_REPO}/commits/${TARGET_SHA}/comments" --input - \
+            > "$LOG_DIR/13-comment.log" 2>&1; then
+            echo "private log: OK"
+          else
+            echo "private log: FAILED" >&2
+          fi
+
+  suite:
+    name: Full suite (parallel MySQL)
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services: *mysql-service
+    env: *job-env
+    steps:
+      - *checkout
+      - *history
+      - *php
+      - *node
+      - *composer-cache
+      - *install
+      - *prepare
+      - *build
+      - *migrate
+      - name: Run security regression suite
+        if: hashFiles('tests/Feature/Security/*.php') != ''
+        run: |
+          php artisan test --compact tests/Feature/Security > "$LOG_DIR/09-security-tests.log" 2>&1 || { echo "security tests: FAILED — see commit comment"; exit 1; }
+          echo "security tests: OK"
+      - name: Run full test suite
+        run: |
+          php artisan test --parallel --processes=4 --recreate-databases > "$LOG_DIR/10-full-suite.log" 2>&1 || { echo "full suite: FAILED — see commit comment"; exit 1; }
+          echo "full suite: OK"
+      - *private-logs
+
+  race:
+    name: Capacity and settlement races (isolated MySQL)
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services: *mysql-service
+    env: *job-env
+    steps:
+      - *checkout
+      - *history
+      - *php
+      - *node
+      - *composer-cache
+      - *install
+      - *prepare
+      - *build
+      - *migrate
+      - name: Prepare capacity-race schema
+        run: |
+          php -r 'new PDO("mysql:host=127.0.0.1;port=3306", "root", "root")->exec("CREATE DATABASE IF NOT EXISTS capacity_race");' > "$LOG_DIR/05-race-schema.log" 2>&1 || { echo "race schema: FAILED — see commit comment"; exit 1; }
+          echo "race schema: OK"
+      - name: Run capacity race tests (MySQL)
+        env:
+          CAPACITY_RACE_DSN: mysql://root:root@127.0.0.1:3306/capacity_race
+        run: |
+          {
+            php artisan test --compact tests/Feature/Concurrency/CapacityRaceTest.php &&
+            php artisan test --compact tests/Feature/Concurrency/CapacityRaceMatrixTest.php &&
+            if [ -f tests/Feature/Concurrency/PartnerStatementLockTest.php ]; then
+              php artisan test --compact tests/Feature/Concurrency/PartnerStatementLockTest.php
+            fi
+          } > "$LOG_DIR/06-race-tests.log" 2>&1 || { echo "race tests: FAILED — see commit comment"; exit 1; }
+          echo "race tests: OK"
+      - *private-logs
+
+  report:
+    name: Report verification result
+    needs: [check, suite, race]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      LOG_DIR: /tmp/ci-logs
+    steps:
+      # This VM never checks out or executes application/dependency code.
+      - name: Publish result status
+        id: result
+        env:
+          GH_TOKEN: ${{ secrets.BOOKINGS_CI_BRIDGE_PAT }}
+          CHECK_RESULT: ${{ needs.check.result }}
+          SUITE_RESULT: ${{ needs.suite.result }}
+          RACE_RESULT: ${{ needs.race.result }}
+        run: |
+          mkdir -p "$LOG_DIR"
+          if [[ ! "$TARGET_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "inputs: FAILED"
+            exit 1
+          fi
+          state=failure
+          if [[ "$CHECK_RESULT" == cancelled || "$SUITE_RESULT" == cancelled || "$RACE_RESULT" == cancelled ]]; then
+            state=error
+          elif [[ "$CHECK_RESULT" == success && "$SUITE_RESULT" == success && "$RACE_RESULT" == success ]]; then
+            state=success
+          fi
           jq -n --arg st "$state" \
             --arg url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
-            --arg desc "ci/verify — $state" \
+            --arg desc "ci/verify - $state" \
             '{state:$st, context:"ci/verify", target_url:$url, description:$desc}' \
             | gh api -X POST "repos/${PRIVATE_REPO}/statuses/${TARGET_SHA}" --input - \
             > "$LOG_DIR/13-status-update.log" 2>&1 || { echo "status update: FAILED"; exit 1; }
-          jq -n --rawfile body "$LOG_DIR/summary.txt" '{body:$body}' \
-            | gh api -X POST "repos/${PRIVATE_REPO}/commits/${TARGET_SHA}/comments" --input - \
-            >> "$LOG_DIR/13-status-update.log" 2>&1 || { echo "commit comment: FAILED"; exit 1; }
+          printf 'state=%s\n' "$state" >> "$GITHUB_OUTPUT"
           echo "status: $state"
 
       - name: Trigger private deploy
         env:
           GH_TOKEN: ${{ secrets.BOOKINGS_CI_BRIDGE_PAT }}
-        if: success() && inputs.deploy == true
+        if: success() && inputs.deploy == true && steps.result.outputs.state == 'success'
         run: |
           # gh workflow run / gh issue hit GraphQL — the bridge PAT is
           # fine-grained (REST-only), so all cross-repo calls use gh api.
@@ -321,7 +423,7 @@ jobs:
       - name: Open issue on nightly failure
         env:
           GH_TOKEN: ${{ secrets.BOOKINGS_CI_BRIDGE_PAT }}
-        if: failure() && inputs.event == 'schedule'
+        if: always() && inputs.event == 'schedule' && (needs.check.result == 'failure' || needs.suite.result == 'failure' || needs.race.result == 'failure')
         run: |
           {
             title="Nightly verify failed ($(date +%F))"

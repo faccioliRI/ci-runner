@@ -240,12 +240,31 @@ jobs:
 
       # Production packages only, high and critical severity. Escape hatch:
       # composer.json config.audit.ignore (advisory id -> reason) or an npm
-      # overrides entry — never continue-on-error.
+      # overrides entry — never continue-on-error. For advisories with no
+      # patched release, the checked-out repo may park single GHSA ids in
+      # .github/npm-audit-allowlist.json (id -> reason); anything else fails.
       - name: Dependency audit
         run: |
           {
             composer audit --locked --no-dev --abandoned=report --ignore-severity=low --ignore-severity=medium &&
-            npm audit --audit-level=high
+            { npm audit --audit-level=high --json > "$LOG_DIR/12-npm-audit.raw.json" || true; } &&
+            node -e '
+              const fs = require("fs");
+              let allow = {};
+              try { allow = JSON.parse(fs.readFileSync(".github/npm-audit-allowlist.json", "utf8")); } catch (e) {}
+              const report = JSON.parse(fs.readFileSync(process.env.LOG_DIR + "/12-npm-audit.raw.json", "utf8"));
+              const bad = new Set();
+              for (const [name, v] of Object.entries(report.vulnerabilities ?? {})) {
+                for (const via of v.via ?? []) {
+                  if (typeof via !== "object" || !["high", "critical"].includes(via.severity)) continue;
+                  const id = (via.url ?? "").match(/GHSA-[a-z0-9-]+/i)?.[0];
+                  if (!id || !(id in allow)) bad.add(name + ": " + (via.title ?? id ?? via.url));
+                }
+              }
+              if (bad.size) { console.error([...bad].join("\n")); process.exit(1); }
+              const parked = Object.keys(allow);
+              console.log("npm audit: OK" + (parked.length ? " (allowlisted: " + parked.join(", ") + ")" : ""));
+            '
           } > "$LOG_DIR/12-audit.log" 2>&1 || { echo "dependency audit: FAILED — see commit comment"; exit 1; }
           echo "dependency audit: OK"
 
